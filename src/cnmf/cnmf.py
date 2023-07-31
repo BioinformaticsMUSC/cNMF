@@ -2,7 +2,7 @@
 
 import numpy as np
 import pandas as pd
-import os, errno
+import os, errno, sys
 import datetime
 import uuid
 import itertools
@@ -467,12 +467,14 @@ class cNMF():
         open(self.paths['nmf_genes_list'], 'w').write('\n'.join(high_variance_genes_filter))
 
         ## Check for any cells that have 0 counts of the overdispersed genes
-        zerocells = norm_counts.X.sum(axis=1)==0
+        zerocells = np.array(norm_counts.X.sum(axis=1)==0).reshape(-1)
         if zerocells.sum()>0:
             examples = norm_counts.obs.index[zerocells]
-            print('Warning: %d cells have zero counts of overdispersed genes. E.g. %s' % (zerocells.sum(), examples[0]))
-            print('Consensus step may not run when this is the case')
-        
+            if zerocells.sum()>100:
+                raise Exception('Error: %d cells have zero counts of overdispersed genes. Printing first 100: %s' % (zerocells.sum(), ', '.join(examples[:100])))
+            else:
+                raise Exception('Error: %d cells have zero counts of overdispersed genes: %s' % (zerocells.sum(), ', '.join(examples)))
+            
         return(norm_counts)
 
     
@@ -709,7 +711,7 @@ class cNMF():
 
     def consensus(self, k, density_threshold=0.5, local_neighborhood_size = 0.30,show_clustering = True,
                   skip_density_and_return_after_stats = False, close_clustergram_fig=False,
-                  refit_usage=True):
+                  refit_usage=True, normalize_tpm_spectra=False):
         """
         Obtain consensus estimates of spectra and usages from a cNMF run and output a clustergram of
         the consensus matrix. Assumes prepare, factorize, and combine steps have already been run.
@@ -737,8 +739,14 @@ class cNMF():
             If True, closes the clustergram figure from output after saving the image to a file
             
         refit_usage : boolean (default=True)
-            If True, refit the usage matrix one final time after finalizing the spectra_tpm matrix. Has been shown
-            to increase inference accuracy in simulations.
+            If True, refit the usage matrix one final time after finalizing the spectra_tpm matrix. Done by regressing 
+            the tpm matrix against the tpm_spectra including only high-variance genes and with both the tpm matrix
+            and tpm_spectra normalized by the standard deviations of the genes in tpm scale.
+            
+        normalize_tpm_spectra : boolean (default=False)
+            If True, renormalizes the tpm_spectra to sum to 1e6 for each program. This is done before refitting usages.
+            If not used, the tpm_spectra are exactly as calcuated when refitting the usage matrix against the tpm matrix
+            and typically will not sum to the same value for each program.
         """
         
         
@@ -823,8 +831,9 @@ class cNMF():
         tpm_stats = load_df_from_npz(self.paths['tpm_stats'])
         spectra_tpm = self.refit_spectra(tpm.X, norm_usages.astype(tpm.X.dtype))
         spectra_tpm = pd.DataFrame(spectra_tpm, index=rf_usages.columns, columns=tpm.var.index)
-        spectra_tpm = spectra_tpm.div(spectra_tpm.sum(axis=1), axis=0) * 1e6
-        
+        if normalize_tpm_spectra:
+            spectra_tpm = spectra_tpm.div(spectra_tpm.sum(axis=1), axis=0) * 1e6
+                    
         # Convert spectra to Z-score units, and obtain results for all genes by running last step of NMF
         # with usages fixed and Z-scored TPM as the input matrix
         if sp.issparse(tpm.X):
@@ -997,15 +1006,29 @@ class cNMF():
             plt.close(fig)
             
             
-    def load_results(self, K, density_threshold, n_top_genes=100):
+    def load_results(self, K, density_threshold, n_top_genes=100, norm_usage = True):
         """
         Loads normalized usages and gene_spectra_scores for a given choice of K and 
         local_density_threshold for the cNMF run. Additionally returns a DataFrame of
-        the top genes linked to each program with the number of genes indicated by the
-        `n_top_genes` parameter
+        the top genes linked to each program
+        
+        Parameters
+        ----------
+        K : int
+            Number of programs (must be within the k values specified in previous steps)
+
+        density_threshold : float
+            Threshold for filtering outlier spectra (must be within the values specified in consensus step)
+
+        n_top_genes : integer, optional (default=100)
+            Number of top genes per program to return
+
+        norm_usage : boolean, optional (default=True)
+            If True, normalize cNMF usages to sum to 1
         
         Returns
-        usage - cNMF usages (cells X K) normalized to sum to 1
+        ----------
+        usage - cNMF usages (cells X K)
         spectra - Z-score regressed coeffecients for each program (K x genes) with higher values cooresponding
                     to better marker genes
         top_genes - ranked list of marker genes per GEP (n_top_genes X K)
@@ -1017,7 +1040,9 @@ class cNMF():
         spectra_tpm = pd.read_csv(tpmfn, sep='\t', index_col=0).T
 
         usage = pd.read_csv(usagefn, sep='\t', index_col=0)
-        usage = usage.div(usage.sum(axis=1), axis=0)
+        
+        if norm_usage:
+            usage = usage.div(usage.sum(axis=1), axis=0)
         
         try:
             usage.columns = [int(x) for x in usage.columns]
